@@ -2307,7 +2307,7 @@ function renderFrame() {
   activeMirror = chooseMirror();
   for (const m of MIRRORS) if (m !== activeMirror) m.mat.uniforms.uActive.value = 0;
   const info = renderer.info; info.reset();
-  if (activeMirror) { if (!renderMirror(activeMirror)) activeMirror = null; }
+  if (activeMirror) { if (!(MP.started ? MP.drawMirror(activeMirror) : renderMirror(activeMirror))) activeMirror = null; }
   lastMirror = activeMirror;
   const mc = info.render.calls, mt = info.render.triangles;
   SU.uCamPos.value.copy(camera.position);
@@ -4872,7 +4872,7 @@ function makeShade(o) {
     [head, V(0, 0.03, 0), V(0, 0.25 * hs, 0.01), 0.07, 0.085, 1.0],
   ];
   for (const a of arms) { segs.push([a.sh, V(0, 0, 0), V(0, -0.3 * P.arm * h, 0), 0.05, 0.04, 0.5]); segs.push([a.el, V(0, 0, 0), V(0, -a.fo - 0.14, 0.01), 0.038, 0.012, 0.5]); }
-  const n = 2000, pos = new Float32Array(n * 3), size = new Float32Array(n), alpha = new Float32Array(n), PT = [];
+  const n = o.particles || 2000, pos = new Float32Array(n * 3), size = new Float32Array(n), alpha = new Float32Array(n), PT = [];
   const wsum = segs.reduce((acc, g) => acc + g[5], 0), rr = seeded(5);
   for (let i = 0; i < n; i++) {
     let pk = rr() * wsum, si = 0; while (pk > segs[si][5] && si < segs.length - 1) { pk -= segs[si][5]; si++; }
@@ -11158,11 +11158,12 @@ function loop(now) {
     Quality.sample(dt);
     runTimers();
     if (UI.overlay === 'panel') { Panel.update(dt); if (Input.ePress && UI.overlay === 'panel') UI.closeOverlay(); Input.ePress = false; Input.click = false; }
-    else if (UI.overlay && (Input.ePress || Input.click)) { UI.closeOverlay(); Input.ePress = false; Input.click = false; }
+    else if (UI.overlay && UI.overlay !== 'mp' && (Input.ePress || Input.click)) { UI.closeOverlay(); Input.ePress = false; Input.click = false; }
     if (Credits.on) { Credits.update(dt); if (keyPressed('Space') || keyPressed('Enter') || Input.ePress) Credits.skip(); }
     if (G.stage !== 'end' && G.stage !== 'title') Run.t += dt;
     if (ClockUI.active) { ClockUI.update(dt); if (!ClockUI.active) { Input.ePress = false; Input.click = false; } }
     Player.update(dt);
+    MP.afterFrame();
     if (MP.started) MP.world(dt); else {
     Interact.update();
     Story.update(dt);
@@ -11175,7 +11176,7 @@ function loop(now) {
     Sound.update(dt);
     UI.updateThought(dt);
     SU.uTime.value = G.t;
-    const needLock = !isTouch && !Input.locked && G.stage !== 'end' && G.stage !== 'black' && UI.overlay !== 'panel';
+    const needLock = !MP.menu && !MP.lobbyOpen && UI.overlay !== 'mp' && !isTouch && !Input.locked && G.stage !== 'end' && G.stage !== 'black' && UI.overlay !== 'panel';
     if (UI.el.dragNote.hidden === needLock) UI.el.dragNote.hidden = !needLock;
   } else if (!G.running) {
     App.titleT += dt;
@@ -11190,9 +11191,206 @@ function loop(now) {
   endInputFrame();
 }
 
+// Shared by the server and the embedded browser adapter.
+function posePayload(q) {
+  return JSON.stringify([1,q.id,q.round,q.n,q.pos,q.yaw,q.pitch,q.flash,q.crouch,q.walk,q.amp,q.path]);
+}
+function validPose(q) {
+  const point=v=>Array.isArray(v)&&v.length===3&&v.every(Number.isFinite)&&v[0]>-5&&v[0]<65&&v[1]>-12&&v[1]<8&&v[2]>-8&&v[2]<30;
+  return !!q&&point(q.pos)&&Number.isFinite(q.yaw)&&Number.isFinite(q.pitch)&&
+    (q.n===undefined||Number.isSafeInteger(q.n)&&q.n>0)&&
+    (q.path===undefined||Array.isArray(q.path)&&q.path.length<=48&&q.path.every(x=>Number.isSafeInteger(x.n)&&point(x.pos)))&&
+    [q.walk??0,q.amp??0,q.crouch??0].every(Number.isFinite);
+}
+function lerpAngle(a,b,k) {
+  return a+Math.atan2(Math.sin(b-a),Math.cos(b-a))*k;
+}
+// Arrival-time interpolation: no remote clock synchronization needed. Never
+// extrapolate beyond 100 ms or predict a player indefinitely after packet loss.
+function sampleMotion(samples,now,delay=60) {
+  if(!samples.length)return null;
+  const target=now-delay;
+  for(let i=1;i<samples.length;i++) {
+    const a=samples[i-1],b=samples[i];
+    if(target<=b.at) {
+      const k=Math.max(0,Math.min(1,(target-a.at)/Math.max(1,b.at-a.at)));
+      return {...b.q,pos:a.q.pos.map((v,j)=>v+(b.q.pos[j]-v)*k),yaw:lerpAngle(a.q.yaw,b.q.yaw,k),pitch:a.q.pitch+(b.q.pitch-a.q.pitch)*k,walk:a.q.walk+(b.q.walk-a.q.walk)*k};
+    }
+  }
+  const b=samples.at(-1),a=samples.at(-2);
+  if(!a||now-b.at>200)return {...b.q,amp:0};
+  const dt=Math.max(20,b.at-a.at),extra=Math.min(100,Math.max(0,target-b.at));
+  const velocity=b.q.pos.map((v,j)=>(v-a.q.pos[j])/dt);
+  const speed=Math.hypot(...velocity),scale=speed>.007?.007/speed:1;
+  return {...b.q,pos:b.q.pos.map((v,j)=>v+velocity[j]*extra*scale)};
+}
+
+/* Small WebRTC mesh (at most five players). Vercel/Redis only handles
+   matchmaking, heartbeats and authoritative game actions. No camera/mic. */
+class MultiplayerNetwork {
+ constructor(mp) {
+  this.mp=mp;this.peers=new Map();this.out=[];this.latest=new Map();this.samples=new Map();this.orphanIce=new Map();
+  this.n=0;this.round=0;this.path=[];this.publishAt=0;this.nextSignal=0;
+  this.supported=typeof RTCPeerConnection!=='undefined'&&!!globalThis.crypto?.subtle;
+  this.iceServers=null;this.turnConfigured=false;this.httpMs=0;
+ }
+ resetRound(round,n=0) {
+  this.round=round;this.n=n;this.path=[];this.latest.clear();this.samples.clear();this.lastPose=null;
+ }
+ sync() {
+  const {state,session}=this.mp;if(!state||!session||!this.supported)return;
+  for(const [id,p]of this.peers)if(!state.players[id]){p.pc.close();this.peers.delete(id);this.latest.delete(id);this.samples.delete(id);}
+  if(!this.iceServers)return;
+  for(const id of Object.keys(state.players))if(id!==session.id&&id>session.id&&!this.peers.has(id))this.offer(id).catch(()=>{});
+ }
+ newPeer(id,link) {
+  const old=this.peers.get(id);if(old)old.pc.close();
+  const pc=new RTCPeerConnection({iceServers:this.iceServers||[{urls:'stun:stun.l.google.com:19302'}]});
+  const p={id,pc,link,ice:this.orphanIce.get(id+link)||[],created:performance.now(),last:0,pingAt:0,rtt:0,retryAt:0};
+  this.orphanIce.delete(id+link);
+  this.peers.set(id,p);
+  pc.onicecandidate=e=>{if(e.candidate&&this.peers.get(id)===p)this.enqueue({to:id,link,type:'ice',data:e.candidate.toJSON()});};
+  pc.ondatachannel=e=>this.bind(p,e.channel);
+  pc.onconnectionstatechange=()=>{if(['failed','closed'].includes(pc.connectionState))p.retryAt=performance.now()+1500;};
+  return p;
+ }
+ async offer(id) {
+  const bytes=crypto.getRandomValues(new Uint8Array(12));const link=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
+  const p=this.newPeer(id,link);
+  this.bind(p,p.pc.createDataChannel('motion',{ordered:false,maxRetransmits:0}));
+  this.bind(p,p.pc.createDataChannel('events',{ordered:true}));
+  await p.pc.setLocalDescription(await p.pc.createOffer());
+  this.enqueue({to:id,link,type:'offer',data:{type:'offer',sdp:p.pc.localDescription.sdp}});
+ }
+ bind(p,ch) {
+  if(ch.label==='motion')p.motion=ch;else if(ch.label==='events')p.events=ch;else{ch.close();return;}
+  ch.onopen=()=>{p.last=performance.now();this.publishAt=0;this.mp.nextPoll=0;};
+  ch.onmessage=e=>{
+   if(this.peers.get(p.id)!==p||typeof e.data!=='string'||e.data.length>16000)return;
+   let m;try{m=JSON.parse(e.data);}catch{return;}
+   if(ch.label==='motion') {
+    if(m.id!==p.id||m.round!==this.round||!validPose(m)||!Number.isSafeInteger(m.n)||typeof m.sig!=='string')return;
+    const prev=this.latest.get(p.id);if(prev&&m.n<=prev.n)return;
+    p.last=performance.now();this.latest.set(p.id,m);
+    let a=this.samples.get(p.id);if(!a){a=[];this.samples.set(p.id,a);}a.push({at:p.last,q:m});if(a.length>10)a.shift();
+   }else if(m.type==='refresh')this.mp.refreshSoon();
+   else if(m.type==='ping')this.send(ch,{type:'pong',at:m.at});
+   else if(m.type==='pong'&&Number.isFinite(m.at))p.rtt=Math.max(0,performance.now()-m.at);
+  };
+ }
+ send(ch,m) {if(ch?.readyState==='open'&&ch.bufferedAmount<16000){try{ch.send(typeof m==='string'?m:JSON.stringify(m));return true;}catch{}}return false;}
+ enqueue(m) {this.out.push(m);if(this.out.length>100)this.out.shift();this.nextSignal=0;}
+ async receive(m) {
+  if(!this.mp.state?.players[m.from]||m.from===this.mp.session.id)return;
+  let p=this.peers.get(m.from);
+  if(m.type==='offer') {
+   // Exactly one initiator per pair prevents offer glare.
+   if(m.from>this.mp.session.id)return;
+   if(p?.link===m.link&&p.pc.remoteDescription)return;
+   p=this.newPeer(m.from,m.link);
+   await p.pc.setRemoteDescription(m.data);
+   await p.pc.setLocalDescription(await p.pc.createAnswer());
+   this.enqueue({to:m.from,link:m.link,type:'answer',data:{type:'answer',sdp:p.pc.localDescription.sdp}});
+  }else {
+   if(!p||p.link!==m.link){if(m.type==='ice'){const key=m.from+m.link;let a=this.orphanIce.get(key);if(!a){a=[];this.orphanIce.set(key,a);}if(a.length<24)a.push(m.data);if(this.orphanIce.size>20)this.orphanIce.delete(this.orphanIce.keys().next().value);}return;}
+   if(m.type==='answer') {if(p.pc.signalingState!=='have-local-offer')return;await p.pc.setRemoteDescription(m.data);}
+   else if(m.type==='ice') {if(!p.pc.remoteDescription){p.ice.push(m.data);return;}await p.pc.addIceCandidate(m.data);}
+  }
+  if(p.pc.remoteDescription)for(const c of p.ice.splice(0))await p.pc.addIceCandidate(c).catch(()=>{});
+ }
+ async signal() {
+  if(!this.supported||!this.mp.active||!this.mp.session||this.signaling||performance.now()<this.nextSignal)return;
+  this.signaling=true;const messages=this.out.splice(0,16);
+  try {
+   const r=await fetch('/api/signal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...this.mp.session,messages}),signal:AbortSignal.timeout(8000)});
+   if(!r.ok)throw Error('Signaling niet beschikbaar.');const j=await r.json();
+   this.iceServers=j.iceServers;this.turnConfigured=j.turnConfigured;
+   for(const m of j.messages)await this.receive(m).catch(()=>{});
+   const now=performance.now();
+   for(const [id,p]of this.peers)if((now-p.created>16000&&p.motion?.readyState!=='open')||(p.retryAt&&now>p.retryAt)||(p.motion?.readyState==='open'&&now-p.last>12000&&this.mp.started)){p.pc.close();this.peers.delete(id);}
+   this.sync();
+   const all=this.connected()===this.expected();this.nextSignal=performance.now()+(this.out.length?100:all?5000:600);
+  }catch {this.out.unshift(...messages);this.out=this.out.slice(-100);this.nextSignal=performance.now()+2000;}
+  finally {this.signaling=false;}
+ }
+ pose() {
+  if(!this.mp.started||!this.mp.me())return null;
+  const me=this.mp.me();if(this.round!==this.mp.round)this.resetRound(this.mp.round,me.motionN||0);
+  const pos=Player.pos.toArray().map(x=>Math.round(x*10000)/10000),n=++this.n;
+  this.path.push({n,pos});if(this.path.length>48)this.path.shift();
+  return {id:this.mp.session.id,round:this.round,n,pos,yaw:Player.yaw,pitch:Player.pitch,flash:Player.flashOn&&Player.flashK>.5&&(typeof Flash==='undefined'||Flash.mul>.3),crouch:Player.crouch,walk:Player.phase,amp:this.mp.controlsActive()?Math.min(1.4,Player.amp):0,path:this.path.slice()};
+ }
+ async publish() {
+  if(!this.mp.started||this.publishing)return;
+  this.publishing=true;
+  try {
+   const q=this.pose();if(!q)return;this.lastPose=q;
+   if(this.supported&&this.mp.session) {
+    if(this.keyToken!==this.mp.session.token){this.keyToken=this.mp.session.token;this.keyPromise=crypto.subtle.importKey('raw',new TextEncoder().encode(this.keyToken),{name:'HMAC',hash:'SHA-256'},false,['sign']);}
+    const sig=await crypto.subtle.sign('HMAC',await this.keyPromise,new TextEncoder().encode(posePayload(q)));
+    q.sig=Array.from(new Uint8Array(sig),b=>b.toString(16).padStart(2,'0')).join('');
+    const data=JSON.stringify(q);for(const p of this.peers.values())this.send(p.motion,data);
+   }
+  }catch {/* HTTPS fallback remains available. */}finally {this.publishing=false;}
+ }
+ update() {
+  const now=performance.now();
+  if(now-this.publishAt>=50){this.publishAt=now-((now-this.publishAt)%50);this.publish();}
+  for(const p of this.peers.values())if(now-p.pingAt>2000){p.pingAt=now;this.send(p.events,{type:'ping',at:now});}
+ }
+ observed() {return [...this.latest.values()].filter(q=>q.round===this.round).slice(0,4);}
+ sample(id,now=performance.now()) {
+  const samples=this.samples.get(id);if(!samples?.length||now-samples.at(-1).at>300)return null;
+  return sampleMotion(samples,now);
+ }
+ changed() {for(const p of this.peers.values())this.send(p.events,{type:'refresh'});}
+ expected() {return Math.max(0,Object.keys(this.mp.state?.players||{}).length-1);}
+ connected() {return [...this.peers.values()].filter(p=>p.motion?.readyState==='open'&&performance.now()-p.last<1500).length;}
+ pollInterval() {return this.mp.started&&this.expected()>0&&this.connected()===this.expected()?1000:250;}
+ status() {
+  const count=this.connected(),total=this.expected(),times=[...this.peers.values()].filter(p=>p.motion?.readyState==='open'&&p.rtt>0).map(p=>p.rtt);
+  const timing=times.length?` · ${Math.round(Math.max(...times))} ms RTT`:'';
+  return count===total&&total>0?`Realtime ${count}/${total} · 20 updates/s${timing}`:`Realtime ${count}/${total} · server ${Math.round(this.httpMs)} ms${this.turnConfigured?'':' · bij blijvende fallback: TURN instellen'}`;
+ }
+ close() {for(const p of this.peers.values())p.pc.close();this.peers.clear();this.out=[];this.latest.clear();this.samples.clear();}
+}
+
+/* Preserve the original meshes, materials and joints. Merge rigid pieces
+   only within their own animated parent; never flatten the skeleton. */
+function compactMultiplayerRig(H) {
+ const keep=new Set([H.headMesh,H.lens,...H.arms.map(a=>a.hand)].filter(Boolean));
+ const parents=[];H.root.traverse(o=>{if(!o.isMesh)parents.push(o);});
+ let before=0,after=0;H.root.traverse(o=>{if(o.isMesh)before++;});
+ for(const parent of parents) {
+  const buckets=new Map();
+  for(const mesh of parent.children) {
+   if(!mesh.isMesh||keep.has(mesh)||Array.isArray(mesh.material))continue;
+   const key=mesh.material;let list=buckets.get(key);if(!list){list=[];buckets.set(key,list);}list.push(mesh);
+  }
+  for(const [mat,list]of buckets) {
+   if(list.length<2)continue;
+   const values={position:[],normal:[],uv:[]};
+   for(const mesh of list) {
+    mesh.updateMatrix();const original=mesh.geometry,g=original.index?original.toNonIndexed():original;
+    const nm=new THREE.Matrix3().getNormalMatrix(mesh.matrix),v=new THREE.Vector3();
+    for(let i=0;i<g.attributes.position.count;i++) {
+     v.fromBufferAttribute(g.attributes.position,i).applyMatrix4(mesh.matrix);values.position.push(v.x,v.y,v.z);
+     v.fromBufferAttribute(g.attributes.normal,i).applyMatrix3(nm).normalize();values.normal.push(v.x,v.y,v.z);
+     const uv=g.attributes.uv;values.uv.push(uv?uv.getX(i):0,uv?uv.getY(i):0);
+    }
+    if(g!==original)g.dispose();original.dispose();parent.remove(mesh);
+   }
+   const geo=new THREE.BufferGeometry();
+   for(const [name,a]of Object.entries(values))geo.setAttribute(name,new THREE.Float32BufferAttribute(a,name==='uv'?2:3));
+   geo.computeBoundingSphere();const merged=new THREE.Mesh(geo,mat);merged.matrixAutoUpdate=false;merged.updateMatrix();parent.add(merged);
+  }
+ }
+ H.root.traverse(o=>{if(o.isMesh)after++;});return {before,after};
+}
+
 /* Awaken’t multiplayer adapter. The original renderer/world stays in index.html. */
 const MP={
- session:null,state:null,active:false,started:false,avatars:new Map(),events:new Set(),busy:false,seq:0,offset:0,panelTask:null,round:0,queue:Promise.resolve(),
+ session:null,state:null,active:false,started:false,avatars:new Map(),events:new Set(),busy:false,seq:0,offset:0,panelTask:null,round:0,queue:Promise.resolve(),menu:false,lobbyOpen:false,nextPoll:0,nextHud:0,
  tasks:[{id:'power',name:'Zekeringkast',pos:[15.03,0,8.85],hint:'Schakelaars: 3 → 1 → 4 → 2',labels:['1','2','3','4']},{id:'radio',name:'Radio',pos:[10.6,0,10.72],hint:'Laag → hoog → midden → laag',labels:['Laag','Midden','Hoog']},{id:'clock',name:'Klokritueel · kelder',pos:[9.8,-2.7,17],hint:'III → III → III',labels:['1','2','3','4']}],
  init(){
  const css=document.createElement('style');css.textContent=`
@@ -11200,48 +11398,70 @@ const MP={
  `;document.head.append(css);
  const el=document.createElement('div');el.innerHTML=`<section id="mp-lobby" class="mp-screen" hidden><div class="mp-card"><h1>AWAKEN’T</h1><p>Eén huis. Vier bewoners. Eén aanwezigheid.</p><div id="mp-connect"><label>Je naam<input id="mp-name" maxlength="24" value="Speler"></label><label>Rol<select id="mp-role"><option value="human">Bewoner · puzzels oplossen en ontsnappen</option><option value="ghost">Ghost · het huis bezitten</option></select></label><div class="mp-row"><button class="mp-btn" id="mp-create">Maak een lobby</button></div><label>Lobbycode<input id="mp-code-input" maxlength="6" placeholder="Bijvoorbeeld A3F91B" autocomplete="off"></label><button class="mp-btn" id="mp-join">Deelnemen</button></div><div id="mp-room" hidden><div class="mp-code" id="mp-code"></div><button class="mp-btn" id="mp-copy">Kopieer uitnodiging</button><ul class="mp-list" id="mp-players"></ul><p class="mp-info">Bewoners: zekeringkast bij de keldertrap, radio in de keuken, klokritueel in de kelder. Daarna naar de voordeur. Je hebt 12 minuten en twee levens. Help een gevallen bewoner door vijf seconden dichtbij te blijven.<br>Ghost: kies je krachten. Maak jezelf zichtbaar voordat je aanvalt. Voltooide puzzels blijven voltooid.</p><div class="mp-row"><button class="mp-btn" id="mp-start">Start ronde</button><button class="mp-btn" id="mp-enter" hidden>Terug naar het huis</button><button class="mp-btn" id="mp-leave">Verlaat lobby</button></div></div><p class="mp-status" id="mp-message"></p><button class="mp-btn" id="mp-back">Terug</button></div></section><aside id="mp-hud" class="mp-hud" hidden><b id="mp-heading"></b><p id="mp-progress"></p><p id="mp-team"></p><p id="mp-near"></p><div id="mp-powers" class="mp-powers"></div><p class="mp-info">WASD bewegen · Shift rennen · F zaklamp · E interactie · Esc menu</p><div class="mp-row"><button class="mp-btn" id="mp-use">Interactie</button><button class="mp-btn" id="mp-menu">Lobby</button></div><p id="mp-net" class="mp-info"></p></aside><div id="mp-puzzle" class="mp-modal" hidden><div class="mp-card"><h2 id="mp-task-name"></h2><p id="mp-task-hint"></p><p id="mp-task-step"></p><div class="mp-row" id="mp-choices"></div><p id="mp-task-msg"></p><button class="mp-btn" id="mp-close">Terug naar het huis</button></div></div><div id="mp-stain" class="mp-stain"></div><div id="mp-aim" class="mp-aim" hidden></div>`;document.body.append(el);
  this.el={};for(const id of ['lobby','connect','room','players','message','hud','heading','progress','team','near','powers','net','puzzle'])this.el[id]=$('mp-'+id);
- const originalObjective=UI.objective.bind(UI);UI.objective=(stage)=>{if(!this.started)return originalObjective(stage);UI.el.objText.textContent='Herstel de zekeringkast, radio en kelderklok. Ontsnap via de voordeur.';UI.el.hintText.textContent=this.me()?.role==='ghost'?'Gebruik 1–6 voor je krachten. Word zichtbaar voordat je aanvalt.':'E bij puzzels, deuren en gevallen bewoners. Samen heb je twaalf minuten.';UI.el.stuck.hidden=true;};const originalPause=App.pause.bind(App),originalResume=App.resume.bind(App);App.pause=()=>{originalPause();if(this.started){this.el.hud.hidden=true;$('mp-aim').hidden=true;}};App.resume=()=>{originalResume();if(this.started){UI.el.hud.hidden=true;this.el.hud.hidden=false;}};const originalStart=App.start.bind(App);this.singleStart=originalStart;App.start=()=>this.openLobby();
- $('mp-create').onclick=()=>this.connect('create');$('mp-join').onclick=()=>this.connect('join');$('mp-start').onclick=()=>this.action({action:this.state.phase==='lobby'?'start':'restart'});$('mp-leave').onclick=()=>this.leave();$('mp-enter').onclick=()=>this.enter();$('mp-back').onclick=()=>{this.el.lobby.hidden=true;if(this.started)this.enter();};$('mp-menu').onclick=()=>this.openLobby();$('mp-use').onclick=()=>this.use();$('mp-close').onclick=()=>this.closePanel();$('mp-copy').onclick=async()=>{const url=new URL(location.href);url.searchParams.set('room',this.session.code);try{await navigator.clipboard.writeText(url.href);this.message('Uitnodigingslink gekopieerd.');}catch{this.message(url.href);}};
+ const originalObjective=UI.objective.bind(UI);UI.objective=(stage)=>{if(!this.started)return originalObjective(stage);UI.el.objText.textContent='Herstel de zekeringkast, radio en kelderklok. Ontsnap via de voordeur.';UI.el.hintText.textContent=this.me()?.role==='ghost'?'Gebruik 1–6 voor je krachten. Word zichtbaar voordat je aanvalt.':'E bij puzzels, deuren en gevallen bewoners. Samen heb je twaalf minuten.';UI.el.stuck.hidden=true;};const originalPause=App.pause.bind(App),originalResume=App.resume.bind(App);App.pause=()=>{if(this.started)this.openMenu();else originalPause();};App.resume=()=>{if(this.started)this.enter();else originalResume();};const originalStart=App.start.bind(App);this.singleStart=originalStart;App.start=()=>this.openLobby();
+ $('mp-create').onclick=()=>this.connect('create');$('mp-join').onclick=()=>this.connect('join');$('mp-start').onclick=()=>this.action({action:this.state.phase==='lobby'?'start':'restart'});$('mp-leave').onclick=()=>this.leave();$('mp-enter').onclick=()=>this.enter();$('mp-back').onclick=()=>{this.el.lobby.hidden=true;this.lobbyOpen=false;if(this.started)this.enter();};$('mp-menu').onclick=()=>this.openLobby();$('mp-use').onclick=()=>this.use();$('mp-close').onclick=()=>this.closePanel();$('mp-copy').onclick=async()=>{const url=new URL(location.href);url.searchParams.set('room',this.session.code);try{await navigator.clipboard.writeText(url.href);this.message('Uitnodigingslink gekopieerd.');}catch{this.message(url.href);}};
  const close=UI.closeOverlay.bind(UI);UI.closeOverlay=()=>{if(UI.overlay==='mp'){this.closePanel();return;}close();};
  const invite=new URL(location.href).searchParams.get('room');if(invite){$('mp-code-input').value=invite;this.openLobby();}
  try{const saved=JSON.parse(sessionStorage.getItem('awakent-mp'));if(saved){this.session=saved;this.seq=saved.seq||0;this.active=true;this.openLobby();}}catch{}
- setInterval(()=>this.poll(),this.interval=300);
+ this.network=new MultiplayerNetwork(this);setInterval(()=>{this.network.signal();this.poll();},100);
  },
  now(){return Date.now()+this.offset;},me(){return this.state?.players[this.session?.id];},message(s){this.el.message.textContent=s;},
  async request(body){const r=await fetch('/api/game',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(9000)});let j;try{j=await r.json();}catch{throw Error('API ontbreekt. Start via npm run dev of deploy het volledige pakket naar Vercel.');}if(!r.ok)throw Error(j.error||'Verbinding mislukt.');return j;},
  save(){sessionStorage.setItem('awakent-mp',JSON.stringify({...this.session,seq:this.seq}));},
  async connect(action){if(this.busy)return;this.busy=true;this.message('Verbinding maken…');try{const j=await this.request({action,name:$('mp-name').value,role:$('mp-role').value,code:$('mp-code-input').value});this.session={code:j.state.code,id:j.id,token:j.token};this.seq=0;this.active=true;this.save();this.accept(j.state);this.message('Deel de code met je vrienden.');}catch(e){this.message(e.message);}finally{this.busy=false;}},
- action(b){this.queue=this.queue.catch(()=>{}).then(async()=>{if(!this.session)return;try{const j=await this.request({...b,...this.session,seq:++this.seq,pose:this.started?{pos:Player.pos.toArray(),yaw:Player.yaw,pitch:Player.pitch}:null});this.save();this.accept(j.state);$('mp-task-msg').textContent='';this.message('');}catch(e){this.message(e.message);$('mp-task-msg').textContent=e.message;this.el.net.textContent=e.message;}});return this.queue;},
- async poll(){if(!this.active||!this.session||this.polling)return;this.polling=true;const begin=performance.now();try{const j=await this.request({...this.session,action:'tick',pose:this.started?{pos:Player.pos.toArray(),yaw:Player.yaw,pitch:Player.pitch}:null});this.accept(j.state);this.lastOK=Date.now();this.el.net.textContent=`Netwerk ${Math.round(performance.now()-begin)} ms · updates 300 ms`;}catch(e){this.el.net.textContent='Verbinding onderbroken · '+e.message;this.message(e.message);}finally{this.polling=false;}},
- accept(s){if(this.state&&s.version<this.state.version)return;this.offset=s.serverNow-Date.now();this.state=s;this.renderLobby();if(s.phase==='playing'&&this.round!==s.until){this.round=s.until;this.startWorld();}if(this.started){const p=this.me();if(p){Player.enabled=p.hp>0&&!p.escaped&&s.phase==='playing';if(Player.pos.distanceTo(V3(...p.pos))>2)Player.pos.set(...p.pos);}for(const [k,on]of Object.entries(s.doors)){const d=DOORS[k];if(d&&this.doorState?.[k]!==on){on?d.open():d.close();}}this.doorState={...s.doors};if(s.tasks.every(t=>t.done)&&DOORS.front.locked){DOORS.front.locked=false;DOORS.front.open();}this.syncAvatars();if(this.panelTask)this.drawTask();}},
- renderLobby(){this.el.connect.hidden=!!this.session;this.el.room.hidden=!this.session;if(!this.state)return;$('mp-code').textContent=this.state.code;this.el.players.textContent='';for(const p of Object.values(this.state.players)){const li=document.createElement('li');li.textContent=`${p.name} — ${p.role==='ghost'?'Ghost':'Bewoner'}${p.id===this.state.host?' · host':''}${p.id===this.session.id?' · jij':''}${this.now()-p.seen>5000?' · verbinding weg':''}`;this.el.players.append(li);}const host=this.state.host===this.session.id;$('mp-start').disabled=!host||this.state.phase==='playing';$('mp-start').textContent=this.state.phase==='lobby'?'Start ronde':'Nieuwe ronde';$('mp-enter').hidden=!this.started;},
- openLobby(){this.el.lobby.hidden=false;if(G.running&&!G.paused)App.pause();this.el.hud.hidden=true;$('mp-aim').hidden=true;},
- enter(){if(!this.started)return;$('mp-aim').hidden=false;this.el.lobby.hidden=true;this.el.hud.hidden=false;UI.el.hud.hidden=true;UI.el.pause.hidden=true;G.paused=false;Sound.resume();if(isTouch)UI.el.touch.hidden=false;lockPointer();},
+ action(b){this.queue=this.queue.catch(()=>{}).then(async()=>{if(!this.session)return;try{const j=await this.request({...b,...this.session,seq:++this.seq,pose:this.started?this.network.pose():null,observed:this.network.observed()});this.save();this.accept(j.state);this.network.changed();$('mp-task-msg').textContent='';this.message('');}catch(e){this.message(e.message);$('mp-task-msg').textContent=e.message;this.el.net.textContent=e.message;}});return this.queue;},
+ refreshSoon(){this.refreshPending=true;this.nextPoll=Math.min(this.nextPoll,performance.now()+30);},
+ async poll(){if(!this.active||!this.session||this.polling||performance.now()<this.nextPoll)return;this.polling=true;this.refreshPending=false;const begin=performance.now();try{const j=await this.request({...this.session,action:'tick',pose:this.started?this.network.pose():null});this.network.httpMs=performance.now()-begin;this.accept(j.state);this.lastOK=Date.now();this.el.net.textContent=this.network.status();}catch(e){this.el.net.textContent='Verbinding onderbroken · '+e.message;this.message(e.message);}finally{this.polling=false;this.nextPoll=this.refreshPending?performance.now()+30:Math.max(performance.now(),begin+this.network.pollInterval());}},
+ controlsActive(){const p=this.me();return !!(this.started&&p&&p.hp>0&&!p.escaped&&this.state.phase==='playing'&&!this.menu&&!this.lobbyOpen&&!UI.overlay);},
+ updateControls(){Player.enabled=this.controlsActive();Player.look=this.started&&!this.menu&&!this.lobbyOpen&&!UI.overlay;},
+ accept(s){if(this.state&&(s.version<this.state.version||s.version===this.state.version&&s.serverNow<this.state.serverNow))return;this.offset=s.serverNow-Date.now();this.state=s;this.renderLobby();if(s.phase==='playing'&&this.round!==s.until){this.round=s.until;this.network.resetRound(this.round,s.players[this.session.id]?.motionN||0);this.startWorld();}this.network.sync();if(this.started){const p=this.me();if(p){this.seq=Math.max(this.seq,p.seq||0);this.updateControls();if(Player.pos.distanceTo(V3(...p.pos))>2){Player.pos.set(...p.pos);Player.vel.set(0,0,0);this.network.path=[];}}for(const [k,on]of Object.entries(s.doors)){const d=DOORS[k];if(d&&this.doorState?.[k]!==on){on?d.open():d.close();}}this.doorState={...s.doors};if(s.tasks.every(t=>t.done)&&DOORS.front.locked){DOORS.front.locked=false;DOORS.front.open();}this.syncAvatars();if(this.panelTask)this.drawTask();this.nextHud=0;this.menuStatus();}},
+ renderLobby(){this.el.connect.hidden=!!this.session;this.el.room.hidden=!this.session;if(!this.state)return;$('mp-code').textContent=this.state.code;const signature=JSON.stringify([this.state.host,this.state.phase,Object.values(this.state.players).map(p=>[p.id,p.name,p.role,this.now()-p.seen>5000])]);if(signature!==this.lobbySignature){this.lobbySignature=signature;this.el.players.textContent='';for(const p of Object.values(this.state.players)){const li=document.createElement('li');li.textContent=`${p.name} — ${p.role==='ghost'?'Ghost':'Bewoner'}${p.id===this.state.host?' · host':''}${p.id===this.session.id?' · jij':''}${this.now()-p.seen>5000?' · verbinding weg':''}`;this.el.players.append(li);}}const host=this.state.host===this.session.id;$('mp-start').disabled=!host||this.state.phase==='playing';$('mp-start').textContent=this.state.phase==='lobby'?'Start ronde':'Nieuwe ronde';$('mp-enter').hidden=!this.started;},
+ clearInput(){Input.keys={};Input.pressed={};Input.ePress=Input.click=Input.fPress=false;Input.mdx=Input.mdy=Input.tmx=Input.tmz=0;Input.dragging=false;Player.vel.x=Player.vel.z=0;},
+ menuStatus(){if(!this.menu&&!this.lobbyOpen)return;const p=this.me();if(!p)return;const line=this.state.phase!=='playing'?(this.state.phase==='ghost'?'De ghost wint. ':'De bewoners winnen. ')+(this.state.reason||''):p.hp<=0?'Je bent uitgeschakeld. Een bewoner kan je helpen.':p.escaped?'Je bent ontsnapt. De andere spelers spelen door.':`De ronde loopt door. Je blijft kwetsbaar · ${p.hp} / 2 levens.`;UI.el.foundText.textContent=line;if(this.lobbyOpen)this.message(line);},
+ openMenu(){if(!this.started||this.menu)return;this.menu=true;G.paused=false;App.pausedAt=performance.now();this.clearInput();if(this.panelTask)this.closePanel(false);this.updateControls();UI.el.pause.hidden=false;UI.el.touch.hidden=true;UI.el.hud.hidden=true;UI.el.dragNote.hidden=true;this.el.hud.hidden=true;$('mp-aim').hidden=true;UI.objective(G.stage);this.menuStatus();if(document.pointerLockElement)document.exitPointerLock();},
+ openLobby(){this.lobbyOpen=true;this.el.lobby.hidden=false;if(this.started){this.menu=false;G.paused=false;this.clearInput();this.closePanel(false);this.updateControls();UI.el.pause.hidden=true;UI.el.touch.hidden=true;this.menuStatus();}this.el.hud.hidden=true;$('mp-aim').hidden=true;},
+ enter(){if(!this.started)return;this.menu=false;this.lobbyOpen=false;this.clearInput();$('mp-aim').hidden=false;this.el.lobby.hidden=true;this.el.hud.hidden=false;UI.el.hud.hidden=true;UI.el.pause.hidden=true;G.paused=false;App.resumedAt=performance.now();Sound.resume();this.updateControls();if(isTouch)UI.el.touch.hidden=false;const wait=Math.max(0,1150-(performance.now()-lastUnlock));if(wait)setTimeout(()=>{if(this.started&&!this.menu&&!this.lobbyOpen)lockPointer();},wait);else lockPointer();},
  startWorld(){
  this.started=true;this.el.lobby.hidden=true;clearTimers();Sound.init();Sound.resume();if(Sound.ok&&!App.ambStarted){Sound.startAmbience();App.ambStarted=true;}Title.close(true);Title.stopTease();UI.el.title.hidden=true;UI.el.loading.hidden=true;UI.el.end.hidden=true;UI.el.pause.hidden=true;UI.el.hud.hidden=true;UI.closeOverlay();Credits.on=false;UI.el.credits.hidden=true;
  Story.applyState('s1');Story.setBasementDoor(true);Story.stage='s1';G.stage='s1';G.running=true;G.paused=false;Story.fade=null;Ent.hide();Ent.H.root.visible=false;Actors.ent.root.visible=false;clearTimers();postMat.uniforms.uFade.value=0;postMat.uniforms.uFear.value=0;shadeMat().uniforms.uFade.value=1;Power.active=false;Power.main=true;Power.dryer=false;Power.apply(false);
  for(const d of Object.values(DOORS)){d.locked=false;d.set(false);}DOORS.front.locked=true;DOORS.front.onUse=()=>true;
  if(W.brickDoor)W.brickDoor.visible=false;LN.basement.on=1;LN.basement.dim=.35;LN.stairs.on=1;LN.deepA.on=0;LN.deepB.on=0;this.baseLights=LIGHTS.map(l=>({l,on:l.on,dim:l.dim}));
- this.doorState={};this.events.clear();this.closePanel();const p=this.me();Player.reset(...p.pos,0,0,false);Player.flashOn=p.role==='human';Player.speedMul=p.role==='ghost'?1.25:1;Fear.level=0;this.el.lobby.hidden=true;this.el.hud.hidden=false;if(isTouch)UI.el.touch.hidden=false;this.buildPowers();this.enter();
+ this.menu=false;this.lobbyOpen=false;this.doorState={};this.events.clear();this.closePanel(false);if(!this.rigOptimized){compactMultiplayerRig(Actors.avatar);this.rigOptimized=true;}const p=this.me();Player.reset(...p.pos,0,0,false);Player.flashOn=p.role==='human';Player.speedMul=p.role==='ghost'?1.25:1;Fear.level=0;this.el.lobby.hidden=true;this.el.hud.hidden=false;if(isTouch)UI.el.touch.hidden=false;this.buildPowers();this.enter();
  },
  buildPowers(){this.el.powers.textContent='';if(this.me()?.role!=='ghost')return;const names=[['manifest','Zichtbaar'],['attack','Aanvallen'],['blackout','Black-out'],['slam','Deuren slaan'],['whisper','Fluisteren'],['sabotage','Sabotage']];names.forEach(([a,n],i)=>{const b=document.createElement('button');b.className='mp-btn';b.dataset.ability=a;b.textContent=`${i+1} · ${n}`;b.onclick=()=>this.action({action:'ability',ability:a});this.el.powers.append(b);});},
- syncAvatars(){for(const p of Object.values(this.state.players)){if(p.id===this.session.id)continue;if(!this.avatars.has(p.id)){const H=p.role==='ghost'?makeShade({}):makePerson({shirt:['#514a40','#434c4f','#554247','#4c513e'][this.avatars.size%4]});H.root.position.set(...p.pos);H.root.traverse(o=>{o.layers.mask=0x7fffffff;o.userData.noLand=true;});scene.add(H.root);DYN.add(H.root);if(H.smoke){H.smoke.pts.layers.mask=0x7fffffff;scene.add(H.smoke.pts);DYN.add(H.smoke.pts);}this.avatars.set(p.id,{H,last:V3(...p.pos),phase:0});}}for(const [id,a]of this.avatars)if(!this.state.players[id]){scene.remove(a.H.root);DYN.delete(a.H.root);if(a.H.smoke){scene.remove(a.H.smoke.pts);DYN.delete(a.H.smoke.pts);a.H.smoke.pts.geometry.dispose();a.H.smoke.pts.material.dispose();}a.H.root.traverse(o=>{o.geometry?.dispose();});this.avatars.delete(id);}},
- nearest(){if(!this.me()||this.me().role==='ghost')return null;return this.tasks.find(t=>Player.pos.distanceTo(V3(...t.pos))<2.5&&losClear(camera.position,V3(t.pos[0],t.pos[1]+1.5,t.pos[2]))&&!this.state.tasks.find(x=>x.id===t.id).done);},
- use(){if(!this.started||this.state.phase!=='playing'||UI.overlay)return;const p=this.me();if(p.hp<=0||p.escaped)return;const t=this.nearest();if(t){this.openTask(t);return;}const down=Object.values(this.state.players).find(x=>x.role==='human'&&x.hp===0&&Player.pos.distanceTo(V3(...x.pos))<2.2);if(down&&p.role==='human'){this.action({action:'revive',target:down.id});return;}if(p.role==='human'&&Player.pos.distanceTo(V3(.8,0,8.5))<2.5&&this.state.tasks.every(t=>t.done)){this.action({action:'escape'});return;}Interact.ray.setFromCamera({x:0,y:0},camera);Interact.ray.far=2.6;const hits=Interact.ray.intersectObjects(Interact.targets(),false).filter(h=>isShown(h.object));const d=hits[0]?.object.userData.use?.door;if(d&&d.name!=='front')this.action({action:'door',door:d.name});},
- openTask(t){this.panelTask=t;UI.overlay='mp';this.el.puzzle.hidden=false;$('mp-task-name').textContent=t.name;$('mp-task-hint').textContent=t.hint;$('mp-choices').textContent='';t.labels.forEach((n,i)=>{const b=document.createElement('button');b.className='mp-btn';b.textContent=n;b.onclick=()=>this.action({action:'solve',task:t.id,choice:i});$('mp-choices').append(b);});this.drawTask();if(document.pointerLockElement)document.exitPointerLock();},
- drawTask(){const t=this.state.tasks.find(x=>x.id===this.panelTask.id);$('mp-task-step').textContent=t.done?'Hersteld. Deze puzzel is voltooid.':`Stap ${t.step+1} · een verkeerde keuze reset de reeks`;for(const b of $('mp-choices').children)b.disabled=t.done;},
- closePanel(){this.panelTask=null;if(UI.overlay==='mp')UI.overlay=null;if(this.el?.puzzle)this.el.puzzle.hidden=true;if(this.started&&G.running&&!G.paused)lockPointer();},
+ syncAvatars(){for(const p of Object.values(this.state.players)){if(p.id===this.session.id)continue;if(!this.avatars.has(p.id)){const H=p.role==='ghost'?makeShade({particles:1000}):makePerson({shirt:['#514a40','#434c4f','#554247','#4c513e'][this.avatars.size%4]});const compact=compactMultiplayerRig(H);H.root.position.set(...p.pos);H.root.traverse(o=>{o.userData.noLand=true;});if(H.eyes)for(const eye of H.eyes.children)eye.material.color.setRGB(.65,.55,.45);scene.add(H.root);DYN.add(H.root);if(H.smoke){scene.add(H.smoke.pts);DYN.add(H.smoke.pts);}this.avatars.set(p.id,{H,phase:0,roomMask:0,target:V3(...p.pos),compact,nextSmoke:0,step:0});}}for(const [id,a]of this.avatars)if(!this.state.players[id]){scene.remove(a.H.root);DYN.delete(a.H.root);if(a.H.smoke){scene.remove(a.H.smoke.pts);DYN.delete(a.H.smoke.pts);a.H.smoke.pts.geometry.dispose();a.H.smoke.pts.material.dispose();}const mats=new Set();a.H.root.traverse(o=>{o.geometry?.dispose();if(o.material&&o.material!==shadeMat()&&!Object.values(PLAIN).includes(o.material))mats.add(o.material);});for(const m of mats)m.dispose();this.avatars.delete(id);}},
+ nearest(force=false){if(!force&&performance.now()<(this.nextNear||0))return this.nearTask;this.nextNear=performance.now()+200;this.nearTask=null;if(!this.me()||this.me().role==='ghost')return null;for(const t of this.tasks){t.point??=V3(...t.pos);t.eye??=V3(t.pos[0],t.pos[1]+1.5,t.pos[2]);if(Player.pos.distanceToSquared(t.point)<6.25&&!this.state.tasks.find(x=>x.id===t.id).done&&losClear(camera.position,t.eye)){this.nearTask=t;break;}}return this.nearTask;},
+ use(){if(!this.controlsActive())return;const p=this.me();const t=this.nearest(true);if(t){this.openTask(t);return;}const down=Object.values(this.state.players).find(x=>x.role==='human'&&x.hp===0&&Player.pos.distanceTo(V3(...x.pos))<2.2);if(down&&p.role==='human'){this.action({action:'revive',target:down.id});return;}if(p.role==='human'&&Player.pos.distanceTo(V3(.8,0,8.5))<2.5&&this.state.tasks.every(t=>t.done)){this.action({action:'escape'});return;}Interact.ray.setFromCamera({x:0,y:0},camera);Interact.ray.far=2.6;const hits=Interact.ray.intersectObjects(Interact.targets(),false).filter(h=>isShown(h.object));const d=hits[0]?.object.userData.use?.door;if(d&&d.name!=='front')this.action({action:'door',door:d.name});},
+ openTask(t){this.panelTask=t;UI.overlay='mp';this.clearInput();this.updateControls();this.el.puzzle.hidden=false;$('mp-task-name').textContent=t.name;$('mp-task-hint').textContent=t.hint;$('mp-choices').textContent='';t.labels.forEach((n,i)=>{const b=document.createElement('button');b.className='mp-btn';b.textContent=n;b.onclick=()=>this.action({action:'solve',task:t.id,choice:i});$('mp-choices').append(b);});this.drawTask();if(document.pointerLockElement)document.exitPointerLock();},
+ drawTask(){if(!this.panelTask)return;const t=this.state.tasks.find(x=>x.id===this.panelTask.id);if(!t)return;$('mp-task-step').textContent=t.done?'Hersteld. Deze puzzel is voltooid.':`Stap ${t.step+1} · een verkeerde keuze reset de reeks`;for(const b of $('mp-choices').children)b.disabled=t.done;},
+ closePanel(capture=true){this.panelTask=null;if(UI.overlay==='mp')UI.overlay=null;if(this.el?.puzzle)this.el.puzzle.hidden=true;if(this.started){this.updateControls();if(capture&&this.controlsActive())lockPointer();}},
  frame(dt){if(!this.started||!this.state)return;const p=this.me(),now=this.now();if(!p)return;
- for(const [id,a]of this.avatars){const q=this.state.players[id];if(!q)continue;const isGhost=q.role==='ghost';a.H.root.visible=!q.escaped&&now-q.seen<60000&&(!isGhost||p.role==='ghost'||q.visibleUntil>now);const old=a.H.root.position.clone();a.H.root.position.lerp(V3(...q.pos),1-Math.exp(-dt*12));const dist=old.distanceTo(a.H.root.position);a.phase+=dist*8;a.H.root.rotation.y=q.yaw+Math.PI;poseHuman(a.H,{walk:a.phase,amp:Math.min(1,dist/Math.max(dt,.001)),pitch:q.pitch,flash:!isGhost,sit:q.hp<=0,hunch:isGhost?.22:0});if(a.H.eyes)for(const eye of a.H.eyes.children)eye.material.color.setRGB(.65,.55,.45);if(a.H.smoke){a.H.root.updateMatrixWorld(true);a.H.smoke.update(G.t);a.H.smoke.pts.visible=a.H.root.visible;}}
+ const localAt=performance.now();this.updateControls();
+ for(const [id,a]of this.avatars){const state=this.state.players[id];if(!state)continue;const direct=this.network.sample(id,localAt),q=direct||state,isGhost=q.role==='ghost'||state.role==='ghost';const root=a.H.root;
+ root.visible=!state.escaped&&now-state.seen<60000&&(!isGhost||p.role==='ghost'||state.visibleUntil>now);
+ a.target.set(...q.pos);const x=root.position.x,z=root.position.z;if(direct)root.position.copy(a.target);else root.position.lerp(a.target,1-Math.exp(-dt*18));
+ const moved=Math.hypot(root.position.x-x,root.position.z-z);a.phase+=moved*8;
+ root.rotation.y=lerpAngle(root.rotation.y,(q.yaw||0)+Math.PI,1-Math.exp(-dt*24));
+ const room=roomOf(root.position.x,root.position.y+1,root.position.z),mask=RBIT[room]||ALLROOMS;
+ if(mask!==a.roomMask){a.roomMask=mask;root.traverse(o=>{o.layers.mask=mask;});if(a.H.smoke)a.H.smoke.pts.layers.mask=mask;}
+ const relevant=root.visible&&!!(mask&(Cull.mask|(lastMirror?Cull.mirrorMask:0)));
+ if(relevant){poseHuman(a.H,{walk:direct?q.walk:a.phase,amp:direct?q.amp:Math.min(1,moved/Math.max(dt,.001)),pitch:q.pitch||0,flash:!isGhost&&!!q.flash,sit:state.hp<=0,hunch:(isGhost?.22:0)+(q.crouch||0)*.22});
+ if(q.crouch>0&&state.hp>0)a.H.hips.position.y-=q.crouch*.28;
+ a.step+=moved;if(!isGhost&&state.hp>0&&a.step>.8){a.step=0;if(Player.pos.distanceToSquared(root.position)<144)Sound.step(room==='basement'?'concrete':room==='bathroom'||room==='kitchen'?'tile':'wood',root.position,{gain:.2,hrtf:true});}}
+ if(a.H.smoke){a.H.smoke.pts.visible=root.visible;if(relevant&&localAt>a.nextSmoke){a.nextSmoke=localAt+33;root.updateMatrixWorld(true);a.H.smoke.update(G.t);}}
+ }
  const dark=this.state.effects.some(e=>e.type==='blackout'&&e.until>now);for(const x of this.baseLights||[])x.l.dim=dark?.03:x.dim;
  for(const e of this.state.effects){if(this.events.has(e.id))continue;this.events.add(e.id);const near=Player.pos.distanceTo(V3(...e.pos));if(e.type==='slam')Sound.play('slam',V3(...e.pos),{gain:.8});if(e.type==='whisper')Sound.play('whispers',V3(e.pos[0],e.pos[1]+1.5,e.pos[2]),{gain:.75,hrtf:true});if(e.type==='attack'&&near<2){Player.shake=.8;$('mp-stain').classList.add('hit');setTimeout(()=>$('mp-stain').classList.remove('hit'),1200);}if(e.type==='wrong'||e.type==='sabotage')Sound.play('static',V3(...e.pos),{gain:.3});}
- if(this.state.phase==='playing'){const t=this.nearest();this.el.near.textContent=p.hp<=0?'Je bent gevallen. Een bewoner kan je helpen.':p.escaped?'Je bent ontsnapt. Wacht op de anderen.':t?`E · ${t.name}`:'E · deur / helpen / ontsnappen';this.el.heading.textContent=`${p.role==='ghost'?'DE AANWEZIGHEID':'BEWONER'} · ${Math.max(0,Math.ceil((this.state.until-now)/1000/60))} min · ${p.role==='ghost'?Math.floor(Math.min(100,p.energy+(now-this.state.serverNow)*.004))+' energie':p.hp+' / 2 levens'}`;this.el.progress.textContent=this.state.tasks.map((t,i)=>(t.done?'✓':'○')+' '+this.tasks[i].name).join(' · ');if(p.reviveAt)this.el.near.textContent=`Helpen · blijf dichtbij · ${Math.max(0,5-Math.floor((now-p.reviveAt)/1000))} sec · druk daarna E`;this.el.team.textContent=Object.values(this.state.players).filter(x=>x.role==='human').map(x=>x.name+': '+(x.escaped?'buiten':x.hp===0?'gevallen':x.hp+' ♥')).join(' · ');}
+ if(localAt>=this.nextHud){this.nextHud=localAt+100;if(this.state.phase==='playing'){const t=this.nearest();this.el.near.textContent=p.hp<=0?'Je bent gevallen. Een bewoner kan je helpen.':p.escaped?'Je bent ontsnapt. Wacht op de anderen.':t?`E · ${t.name}`:'E · deur / helpen / ontsnappen';this.el.heading.textContent=`${p.role==='ghost'?'DE AANWEZIGHEID':'BEWONER'} · ${Math.max(0,Math.ceil((this.state.until-now)/1000/60))} min · ${p.role==='ghost'?Math.floor(Math.min(100,p.energy+(now-this.state.serverNow)*.004))+' energie':p.hp+' / 2 levens'}`;this.el.progress.textContent=this.state.tasks.map((t,i)=>(t.done?'✓':'○')+' '+this.tasks[i].name).join(' · ');if(p.reviveAt)this.el.near.textContent=`Helpen · blijf dichtbij · ${Math.max(0,5-Math.floor((now-p.reviveAt)/1000))} sec · druk daarna E`;this.el.team.textContent=Object.values(this.state.players).filter(x=>x.role==='human').map(x=>x.name+': '+(x.escaped?'buiten':x.hp===0?'gevallen':x.hp+' ♥')).join(' · ');}
  else{this.el.heading.textContent=this.state.phase==='ghost'?'DE GHOST WINT':'DE BEWONERS WINNEN';this.el.near.textContent=this.state.reason||'';this.el.progress.textContent='Open de lobby voor een nieuwe ronde.';}
  for(const b of this.el.powers.children){const a=b.dataset.ability;const left=Math.max(0,Math.ceil(((p.cooldowns[a]||0)-now)/1000));b.disabled=left>0||this.state.phase!=='playing';b.title=left?`${left} seconden cooldown`:a==='attack'?'Binnen 2,2 meter; eerst zichtbaar worden':'';}
- if(!G.paused&&this.state.phase==='playing'&&!UI.overlay){if(Input.ePress||Input.click){this.use();Input.ePress=false;Input.click=false;}if(p.role==='ghost'){['manifest','attack','blackout','slam','whisper','sabotage'].forEach((a,i)=>{if(keyPressed('Digit'+(i+1)))this.action({action:'ability',ability:a});});}}
+ this.menuStatus();}
+ if(this.controlsActive()){if(Input.ePress||Input.click){this.use();Input.ePress=false;Input.click=false;}if(p.role==='ghost'){['manifest','attack','blackout','slam','whisper','sabotage'].forEach((a,i)=>{if(keyPressed('Digit'+(i+1)))this.action({action:'ability',ability:a});});}}
  },
- world(dt){for(const d of Object.values(DOORS))d.update(dt);for(const c of Object.values(CLOCKS))c.update(dt);for(const m of MIRRORS){m.queue=[];m.mode='normal';}if(W.tvOn)W.tvScreen.material.uniforms.uTexOff.value.set(Math.random(),Math.random());},
- async leave(){await this.action({action:'leave'});this.active=false;sessionStorage.removeItem('awakent-mp');location.href=location.pathname;}
+ afterFrame(){if(this.started)this.network.update();},
+ drawMirror(m){const at=performance.now();if(this.mirrorCached===m&&at-this.mirrorAt<33&&this.mirrorSize===RW+'x'+RH){m.mat.uniforms.uActive.value=1;return true;}const ok=renderMirror(m);if(ok){this.mirrorCached=m;this.mirrorAt=at;this.mirrorSize=RW+'x'+RH;}return ok;},
+ world(dt){for(const d of Object.values(DOORS))d.update(dt);for(const c of Object.values(CLOCKS))c.update(dt);for(const m of MIRRORS){if(m.queue)m.queue.length=0;m.mode='normal';}if(W.tvOn)W.tvScreen.material.uniforms.uTexOff.value.set(Math.random(),Math.random());},
+ async leave(){await this.action({action:'leave'});this.active=false;this.network.close();sessionStorage.removeItem('awakent-mp');location.href=location.pathname;}
 };
 
 (function bootstrap() {

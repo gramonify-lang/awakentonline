@@ -1,1 +1,1 @@
-{"functions":{"api/game.js":{"maxDuration":10}},"headers":[{"source":"/api/(.*)","headers":[{"key":"Cache-Control","value":"no-store"}]}]}
+{"functions":{"api/game.js":{"maxDuration":30},"api/signal.js":{"maxDuration":30}},"headers":[{"source":"/api/(.*)","headers":[{"key":"Cache-Control","value":"no-store"}]}]}
